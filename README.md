@@ -56,7 +56,7 @@ chmod +x build.sh
 
 - [x] **Generic Template Support:** Enabled allocation for any data type using C++ templates.
 - [x] **Benchmark Suite:** High-pressure test vs Standard Malloc.
-- [ ] **Thread-Safety:** Implement lock-free atomic pointers for multi-threaded environments.
+- [x] **Thread-Safety:** Implement lock-free atomic pointers for multi-threaded environments.
 - [ ] **Slab Growth:** Allow the pool to request more memory "slabs" from the OS dynamically.
 
 
