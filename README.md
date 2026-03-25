@@ -40,7 +40,7 @@ Optimized for **FreeBSD** and **Linux** (x86_64). Requires a compiler with C++20
 
 ```bash
 # Clone the repository
-git clone [https://github.com/kauan-systems/cpp-memory-pool](https://github.com/kauan-systems/cpp-memory-pool)
+git clone https://github.com/kauan-systems/cpp-memory-pool
 cd cpp-memory-pool
 
 # Run the industrial build and benchmark suite
