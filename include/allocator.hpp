@@ -1,128 +1,131 @@
-/**
- * @file allocator.hpp
- * @brief High-performance, Lock-Free Memory Pool with ABA protection.
- * @details This implementation uses a Lock-Free Singly Linked List (Stack) 
- * approach with 128-bit atomic operations (Double-Width CAS) to manage 
- * memory blocks without mutexes.
- */
-
 #pragma once
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
 
 /**
- * @class MemoryPool
- * @brief A thread-safe, fixed-size memory allocator.
- * @tparam T The type of object to be managed by the pool.
+ * @brief Macro to force inlining across different compilers.
+ * Vital for high-performance allocators to eliminate function call overhead in hot paths.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+    #define FORCE_INLINE __attribute__((always_inline)) inline
+#else
+    #define FORCE_INLINE inline
+#endif
+
+/**
+ * @brief A high-performance, lock-free, thread-aware Memory Pool.
+ * * Uses a two-layer allocation strategy:
+ * 1. L1: Thread-Local Storage (TLS) cache for zero-contention fast paths.
+ * 2. L2: Global lock-free stack using 128-bit Atomic Compare-and-Swap (CAS).
+ * * @tparam T The type of object to be managed by the pool.
  */
 template <typename T>
 class MemoryPool {
 private:
-    /**
-     * @brief Internal structure representing a free block of memory.
-     * Only used when the block is not allocated to the user.
+    /** @brief Internal structure representing a free memory block. */
+    struct Block { Block* next; };
+
+    /** * @brief ABA-resistant tagged pointer for lock-free operations.
+     * alignas(16) is required for double-width CAS operations (DWCAS).
      */
-    struct Block {
-        Block* next;
+    struct alignas(16) TaggedPointer { 
+        Block* ptr; 
+        uintptr_t tag; 
     };
 
-    /**
-     * @brief 16-byte (128-bit) structure to prevent the ABA problem.
-     * Combines a raw pointer with a generational counter (tag).
-     */
-    struct alignas(16) TaggedPointer {
-        Block* ptr;    ///< Pointer to the memory block
-        uintptr_t tag; ///< Incremental version counter to detect re-use
-    };
-
-    T* pool_start;              ///< Start address of the raw memory chunk
-    const size_t block_unit_size; ///< Size of each block (max of T and Block)
-    const size_t total_blocks;    ///< Maximum capacity of the pool
+    /** @brief L1 Layer: Private thread-local cache to bypass global atomic contention. */
+    static constexpr size_t L1_SIZE = 2048;
     
-    /**
-     * @brief Atomic head of the free-list.
-     * Forced 16-byte alignment to support CMPXCHG16B on x86_64 architectures.
+    /** @brief Refill/Flush batch size to amortize the cost of atomic operations. */
+    static constexpr size_t BATCH = 256;
+
+    /** @brief Storage structure for the thread-local L1 cache. */
+    struct LocalCache {
+        Block* storage[L1_SIZE];
+        size_t count = 0;
+    };
+    
+    /** @brief Thread-local instance of the L1 cache. */
+    inline static thread_local LocalCache l1;
+
+    T* pool_start;
+    const size_t block_unit_size;
+    
+    /** * @brief L2 Layer: Global atomic head. 
+     * alignas(64) prevents "False Sharing" by isolating the head on its own cache line.
      */
-    alignas(16) std::atomic<TaggedPointer> next_free_block;
+    alignas(64) std::atomic<TaggedPointer> head;
 
 public:
     /**
-     * @brief Constructor: Pre-allocates a contiguous block of memory.
-     * @param num_blocks The number of elements the pool can hold.
+     * @brief Constructs the Memory Pool and pre-allocates a contiguous block of memory.
+     * @param n Number of blocks to pre-allocate.
      */
-    MemoryPool(size_t num_blocks) 
-        : pool_start(nullptr),
-          block_unit_size(sizeof(T) > sizeof(Block) ? sizeof(T) : sizeof(Block)),
-          total_blocks(num_blocks) 
-    {
-        // Allocate raw memory for the entire pool
-        pool_start = static_cast<T*>(operator new(block_unit_size * total_blocks));
+    MemoryPool(size_t n) : block_unit_size(sizeof(T) > sizeof(Block) ? sizeof(T) : sizeof(Block)) {
+        pool_start = static_cast<T*>(operator new(block_unit_size * n));
+        Block* curr = reinterpret_cast<Block*>(pool_start);
         
-        Block* first_block = reinterpret_cast<Block*>(pool_start);
-        Block* current = first_block;
-
-        // Link all blocks together in a free-list
-        for (size_t i = 0; i < total_blocks - 1; i++) {
-            char* next_ptr = reinterpret_cast<char*>(current) + block_unit_size;
-            current->next = reinterpret_cast<Block*>(next_ptr);
-            current = current->next;
+        // Link all blocks in a linear chain initially
+        for (size_t i = 0; i < n - 1; i++) {
+            curr->next = reinterpret_cast<Block*>(reinterpret_cast<char*>(curr) + block_unit_size);
+            curr = curr->next;
         }
-        current->next = nullptr;
-
-        // Initialize the atomic head pointing to the first block
-        next_free_block.store({first_block, 0}, std::memory_order_release);
+        curr->next = nullptr;
+        
+        // Initialize global head with the first block
+        head.store({reinterpret_cast<Block*>(pool_start), 0}, std::memory_order_release);
     }
 
-    /**
-     * @brief Destructor: Frees the entire memory region.
-     */
-    ~MemoryPool() {
-        operator delete(pool_start);
-    }
+    /** @brief Destructor: Releases the entire memory block allocated by the pool. */
+    ~MemoryPool() { operator delete(pool_start); }
 
-    // Disable copy constructor and assignment to prevent memory corruption
+    // Disable copy/assignment to prevent double-frees or pointer corruption
     MemoryPool(const MemoryPool&) = delete;
     MemoryPool& operator=(const MemoryPool&) = delete;
 
     /**
-     * @brief Allocates a block from the pool.
-     * @return T* Pointer to the allocated memory, or nullptr if the pool is empty.
+     * @brief Allocates a block of memory from the pool.
+     * @return T* Pointer to the allocated memory, or nullptr if the pool is exhausted.
      */
-    T* allocate() {
-        TaggedPointer old_head = next_free_block.load(std::memory_order_acquire);
-        while (old_head.ptr) {
-            // Prepare the new head (pointing to the next element in the list)
-            TaggedPointer new_head = {old_head.ptr->next, old_head.tag + 1};
-
-            // Atomic Compare-and-Swap: ensure the head hasn't changed since we loaded it
-            if (next_free_block.compare_exchange_weak(old_head, new_head, 
-                std::memory_order_acq_rel, std::memory_order_acquire)) 
-            {
-                return reinterpret_cast<T*>(old_head.ptr);
+    [[nodiscard]] FORCE_INLINE T* allocate() {
+        // Path 1: If L1 is empty, attempt to refill from L2 Global Root
+        if (l1.count == 0) {
+            for(size_t i = 0; i < BATCH; ++i) {
+                TaggedPointer old = head.load(std::memory_order_acquire);
+                if (!old.ptr) break;
+                
+                // Atomic DWCAS to move the global stack head
+                if (head.compare_exchange_weak(old, {old.ptr->next, old.tag + 1}, 
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    l1.storage[l1.count++] = old.ptr;
+                }
             }
-            // Loop continues if compare_exchange fails due to contention
         }
-        return nullptr;
+        
+        // Path 2: Return from L1 cache (High-speed path)
+        return (l1.count > 0) ? reinterpret_cast<T*>(l1.storage[--l1.count]) : nullptr;
     }
 
     /**
-     * @brief Returns a block to the pool, making it available for re-allocation.
-     * @param p Pointer to the memory block to deallocate.
+     * @brief Deallocates memory and returns it to the pool.
+     * @param p Pointer to the memory block to be returned.
      */
-    void deallocate(T* p) {
+    FORCE_INLINE void deallocate(T* p) {
         if (!p) return;
 
-        Block* new_node = reinterpret_cast<Block*>(p);
-        TaggedPointer old_head = next_free_block.load(std::memory_order_relaxed);
-        TaggedPointer new_head;
-
+        // Path 1: Store in L1 cache if space is available
+        if (l1.count < L1_SIZE) {
+            l1.storage[l1.count++] = reinterpret_cast<Block*>(p);
+            return;
+        }
+        
+        // Path 2: L1 is full, flush current block to the L2 Global Root
+        Block* node = reinterpret_cast<Block*>(p);
+        TaggedPointer old = head.load(std::memory_order_relaxed);
         do {
-            // Re-link the deallocated node to the current head
-            new_node->next = old_head.ptr;
-            // Increment the tag to prevent ABA issues during simultaneous access
-            new_head = {new_node, old_head.tag + 1};
-        } while (!next_free_block.compare_exchange_weak(old_head, new_head,
+            node->next = old.ptr;
+        } while (!head.compare_exchange_weak(old, {node, old.tag + 1}, 
             std::memory_order_acq_rel, std::memory_order_relaxed));
     }
 };
